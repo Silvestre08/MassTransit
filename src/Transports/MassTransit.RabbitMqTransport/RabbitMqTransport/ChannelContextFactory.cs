@@ -28,7 +28,8 @@
 
             Task HandleShutdown(object sender, ShutdownEventArgs args)
             {
-                _ = Task.Run(() => asyncContext.Stop(args.ReplyText));
+                Task.Run(() => asyncContext.Stop(args.ReplyText))
+                    .IgnoreUnobservedExceptions();
 
                 return Task.CompletedTask;
             }
@@ -65,25 +66,25 @@
             return asyncContext;
         }
 
-        public IActivePipeContextAgent<ChannelContext> CreateActiveContext(ISupervisor supervisor,
-            PipeContextHandle<ChannelContext> context, CancellationToken cancellationToken)
+        public IActivePipeContextAgent<ChannelContext> CreateActiveContext(ISupervisor supervisor, PipeContextHandle<ChannelContext> context,
+            CancellationToken cancellationToken)
         {
             return supervisor.AddActiveContext(context, CreateSharedChannel(context.Context, cancellationToken));
         }
 
         static async Task<ChannelContext> CreateSharedChannel(Task<ChannelContext> context, CancellationToken cancellationToken)
         {
-            return context.IsCompletedSuccessfully()
+            return context.Status == TaskStatus.RanToCompletion
                 ? new ScopeChannelContext(context.Result, cancellationToken)
                 : new ScopeChannelContext(await context.OrCanceled(cancellationToken).ConfigureAwait(false), cancellationToken);
         }
 
         Task<ChannelContext> CreateChannel(IAsyncPipeContextAgent<ChannelContext> asyncContext, CancellationToken cancellationToken)
         {
-            static Task<ChannelContext> CreateChannelContext(ConnectionContext connectionContext, CancellationToken createCancellationToken,
+            Task<ChannelContext> CreateChannelContext(ConnectionContext connectionContext, CancellationToken createCancellationToken,
                 ushort? concurrentMessageLimit)
             {
-                return connectionContext.CreateChannelContext(createCancellationToken, concurrentMessageLimit);
+                return connectionContext.CreateChannelContext(asyncContext, concurrentMessageLimit, createCancellationToken);
             }
 
             return _supervisor.CreateAgent(asyncContext, (context, token) => CreateChannelContext(context, token, _concurrentMessageLimit), cancellationToken);

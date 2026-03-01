@@ -4,10 +4,12 @@
     using System.Collections.Generic;
     using System.Threading;
     using System.Threading.Tasks;
+    using Internals;
     using MassTransit.Middleware;
     using RabbitMQ.Client;
     using RabbitMQ.Client.Events;
     using RabbitMQ.Client.Exceptions;
+    using Transports;
 
 
     public class RabbitMqChannelContext :
@@ -15,30 +17,35 @@
         ChannelContext,
         IAsyncDisposable
     {
+        readonly IAgent _agent;
+        readonly CancellationToken _cancellationToken;
         readonly IChannel _channel;
-        readonly ConnectionContext _connectionContext;
+        CancellationTokenSource _tokenSource;
 
-        public RabbitMqChannelContext(ConnectionContext connectionContext, IChannel channel, CancellationToken cancellationToken)
+        public RabbitMqChannelContext(ConnectionContext connectionContext, IChannel channel, IAgent agent, CancellationToken cancellationToken)
             : base(connectionContext)
         {
-            _connectionContext = connectionContext;
-            _channel = channel;
-            CancellationToken = cancellationToken;
+            ConnectionContext = connectionContext;
 
-            _channel.ContinuationTimeout = _connectionContext.ContinuationTimeout;
+            _channel = channel;
+            _agent = agent;
+
+            _cancellationToken = cancellationToken;
+            _tokenSource = CancellationTokenSource.CreateLinkedTokenSource(connectionContext.CancellationToken, cancellationToken);
         }
 
-        public override CancellationToken CancellationToken { get; }
+        public override CancellationToken CancellationToken => _tokenSource?.Token ?? _cancellationToken;
 
         public IChannel Channel => _channel;
 
-        ConnectionContext ChannelContext.ConnectionContext => _connectionContext;
+        public ConnectionContext ConnectionContext { get; }
 
-        public Task BasicPublishAsync(string exchange, string routingKey, bool mandatory, BasicProperties basicProperties, byte[] body, bool awaitAck)
+        public Task BasicPublishAsync(string exchange, string routingKey, bool mandatory, BasicProperties basicProperties, byte[] body, bool awaitAck,
+            CancellationToken cancellationToken)
         {
             Task PublishAndMaybeAwaitAck()
             {
-                var task = _channel.BasicPublishAsync(exchange, routingKey, mandatory, basicProperties, new ReadOnlyMemory<byte>(body), CancellationToken);
+                var task = _channel.BasicPublishAsync(exchange, routingKey, mandatory, basicProperties, new ReadOnlyMemory<byte>(body), cancellationToken);
 
                 async Task WaitAck()
                 {
@@ -50,6 +57,10 @@
                     {
                         throw new MessageReturnedException("The message was returned by RabbitMQ", exception);
                     }
+                    catch (PublishException exception)
+                    {
+                        throw new RabbitMqConnectionException("BasicPublishAsync failed", exception);
+                    }
                 }
 
                 return awaitAck ? WaitAck() : Task.CompletedTask;
@@ -58,47 +69,50 @@
             return PublishAndMaybeAwaitAck();
         }
 
-        public Task ExchangeBind(string destination, string source, string routingKey, IDictionary<string, object> arguments)
+        public Task ExchangeBind(string destination, string source, string routingKey, IDictionary<string, object> arguments,
+            CancellationToken cancellationToken)
         {
-            return _channel.ExchangeBindAsync(destination, source, routingKey, arguments, false, CancellationToken);
+            return _channel.ExchangeBindAsync(destination, source, routingKey, arguments, false, cancellationToken);
         }
 
-        public Task ExchangeDeclare(string exchange, string type, bool durable, bool autoDelete, IDictionary<string, object> arguments)
+        public Task ExchangeDeclare(string exchange, string type, bool durable, bool autoDelete, IDictionary<string, object> arguments,
+            CancellationToken cancellationToken)
         {
-            return _channel.ExchangeDeclareAsync(exchange, type, durable, autoDelete, arguments, false, CancellationToken);
+            return _channel.ExchangeDeclareAsync(exchange, type, durable, autoDelete, arguments, false, cancellationToken);
         }
 
-        public Task ExchangeDeclarePassive(string exchange)
+        public Task ExchangeDeclarePassive(string exchange, CancellationToken cancellationToken)
         {
-            return _channel.ExchangeDeclarePassiveAsync(exchange, CancellationToken);
+            return _channel.ExchangeDeclarePassiveAsync(exchange, cancellationToken);
         }
 
-        public Task QueueBind(string queue, string exchange, string routingKey, IDictionary<string, object> arguments)
+        public Task QueueBind(string queue, string exchange, string routingKey, IDictionary<string, object> arguments, CancellationToken cancellationToken)
         {
-            return _channel.QueueBindAsync(queue, exchange, routingKey, arguments, false, CancellationToken);
+            return _channel.QueueBindAsync(queue, exchange, routingKey, arguments, false, cancellationToken);
         }
 
-        Task<QueueDeclareOk> ChannelContext.QueueDeclare(string queue, bool durable, bool exclusive, bool autoDelete, IDictionary<string, object> arguments)
+        public Task<QueueDeclareOk> QueueDeclare(string queue, bool durable, bool exclusive, bool autoDelete, IDictionary<string, object> arguments,
+            CancellationToken cancellationToken)
         {
-            return _channel.QueueDeclareAsync(queue, durable, exclusive, autoDelete, arguments, false, CancellationToken);
+            return _channel.QueueDeclareAsync(queue, durable, exclusive, autoDelete, arguments, false, cancellationToken);
         }
 
-        public Task<QueueDeclareOk> QueueDeclarePassive(string queue)
+        public Task<QueueDeclareOk> QueueDeclarePassive(string queue, CancellationToken cancellationToken)
         {
-            return _channel.QueueDeclarePassiveAsync(queue, CancellationToken);
+            return _channel.QueueDeclarePassiveAsync(queue, cancellationToken);
         }
 
-        public Task<uint> QueuePurge(string queue)
+        public Task<uint> QueuePurge(string queue, CancellationToken cancellationToken)
         {
-            return _channel.QueuePurgeAsync(queue, CancellationToken);
+            return _channel.QueuePurgeAsync(queue, cancellationToken);
         }
 
-        public Task BasicQos(uint prefetchSize, ushort prefetchCount, bool global)
+        public Task BasicQos(uint prefetchSize, ushort prefetchCount, bool global, CancellationToken cancellationToken)
         {
-            return _channel.BasicQosAsync(prefetchSize, prefetchCount, global, CancellationToken);
+            return _channel.BasicQosAsync(prefetchSize, prefetchCount, global, cancellationToken);
         }
 
-        public ValueTask BasicAck(ulong deliveryTag, bool multiple)
+        public ValueTask BasicAck(ulong deliveryTag, bool multiple, CancellationToken cancellationToken)
         {
             if (_channel.IsClosed)
             {
@@ -106,17 +120,17 @@
                     new ShutdownEventArgs(ShutdownInitiator.Peer, 491, $"Channel is already closed: {_channel.CloseReason}"));
             }
 
-            return _channel.BasicAckAsync(deliveryTag, multiple, CancellationToken);
+            return _channel.BasicAckAsync(deliveryTag, multiple, cancellationToken);
         }
 
-        public async Task BasicNack(ulong deliveryTag, bool multiple, bool requeue)
+        public async Task BasicNack(ulong deliveryTag, bool multiple, bool requeue, CancellationToken cancellationToken)
         {
             if (_channel.IsClosed)
                 return;
 
             try
             {
-                await _channel.BasicNackAsync(deliveryTag, multiple, requeue, CancellationToken).ConfigureAwait(false);
+                await _channel.BasicNackAsync(deliveryTag, multiple, requeue, cancellationToken).ConfigureAwait(false);
             }
             catch (AlreadyClosedException) // if we are shutting down, the broker would already nack prefetched messages anyway
             {
@@ -129,9 +143,15 @@
             return _channel.BasicConsumeAsync(queue, noAck, consumerTag, false, exclusive, arguments, consumer, cancellationToken);
         }
 
-        public async Task BasicCancel(string consumerTag)
+        public async Task BasicCancel(string consumerTag, CancellationToken cancellationToken)
         {
-            await _channel.BasicCancelAsync(consumerTag, false, CancellationToken);
+            await _channel.BasicCancelAsync(consumerTag, false, cancellationToken);
+        }
+
+        public void NotifyFaulted(Exception exception, Uri inputAddress)
+        {
+            Task.Run(() => _agent.Stop($"Unrecoverable exception on {inputAddress.GetEndpointName()}", CancellationToken.None), CancellationToken.None)
+                .IgnoreUnobservedExceptions();
         }
 
         public async ValueTask DisposeAsync()
@@ -139,6 +159,9 @@
             const string message = "ChannelContext Disposed";
 
             await _channel.Cleanup(200, message, CancellationToken).ConfigureAwait(false);
+
+            _tokenSource?.Dispose();
+            _tokenSource = null;
         }
     }
 }
